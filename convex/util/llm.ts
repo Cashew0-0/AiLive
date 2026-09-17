@@ -3,8 +3,9 @@
 const OPENAI_EMBEDDING_DIMENSION = 1536;
 const TOGETHER_EMBEDDING_DIMENSION = 768;
 const OLLAMA_EMBEDDING_DIMENSION = 1024;
+const GEMINI_EMBEDDING_DIMENSION = 3072;
 
-export const EMBEDDING_DIMENSION: number = OLLAMA_EMBEDDING_DIMENSION;
+export const EMBEDDING_DIMENSION: number = GEMINI_EMBEDDING_DIMENSION;
 
 export function detectMismatchedLLMProvider() {
   switch (EMBEDDING_DIMENSION) {
@@ -22,6 +23,13 @@ export function detectMismatchedLLMProvider() {
         );
       }
       break;
+    case GEMINI_EMBEDDING_DIMENSION:
+      if (!process.env.GEMINI_API_KEY) {
+        throw new Error(
+          "Are you trying to use Gemini? If so, run: npx convex env set GEMINI_API_KEY 'your-key'",
+        );
+      }
+      break;
     case OLLAMA_EMBEDDING_DIMENSION:
       break;
     default:
@@ -35,8 +43,13 @@ export function detectMismatchedLLMProvider() {
 }
 
 export interface LLMConfig {
-  provider: 'openai' | 'together' | 'ollama' | 'custom';
+  provider: 'openai' | 'together' | 'gemini' | 'ollama' | 'custom';
   url: string; // Should not have a trailing slash
+  // Paths appended to `url` for each kind of request. Most OpenAI-compatible
+  // APIs use the /v1 prefix, but Gemini's compat layer doesn't, so this is
+  // configurable per provider instead of hardcoded at the call site.
+  chatPath: string;
+  embeddingsPath: string;
   chatModel: string;
   embeddingModel: string;
   stopWords: string[];
@@ -52,6 +65,8 @@ export function getLLMConfig(): LLMConfig {
     return {
       provider: 'openai',
       url: 'https://api.openai.com',
+      chatPath: '/v1/chat/completions',
+      embeddingsPath: '/v1/embeddings',
       chatModel: process.env.OPENAI_CHAT_MODEL ?? 'gpt-4o-mini',
       embeddingModel: process.env.OPENAI_EMBEDDING_MODEL ?? 'text-embedding-ada-002',
       stopWords: [],
@@ -65,11 +80,33 @@ export function getLLMConfig(): LLMConfig {
     return {
       provider: 'together',
       url: 'https://api.together.xyz',
+      chatPath: '/v1/chat/completions',
+      embeddingsPath: '/v1/embeddings',
       chatModel: process.env.TOGETHER_CHAT_MODEL ?? 'meta-llama/Llama-3-8b-chat-hf',
       embeddingModel:
         process.env.TOGETHER_EMBEDDING_MODEL ?? 'togethercomputer/m2-bert-80M-8k-retrieval',
       stopWords: ['<|eot_id|>'],
       apiKey: process.env.TOGETHER_API_KEY,
+    };
+  }
+  if (provider ? provider === 'gemini' : process.env.GEMINI_API_KEY) {
+    if (EMBEDDING_DIMENSION !== GEMINI_EMBEDDING_DIMENSION) {
+      throw new Error('EMBEDDING_DIMENSION must be 3072 for Gemini');
+    }
+    if (!process.env.GEMINI_API_KEY) {
+      throw new Error("Set your Gemini key: npx convex env set GEMINI_API_KEY 'your-key'");
+    }
+    return {
+      provider: 'gemini',
+      // Gemini's OpenAI-compatible layer. No /v1 segment here — see chatPath
+      // and embeddingsPath below instead.
+      url: 'https://generativelanguage.googleapis.com/v1beta/openai',
+      chatPath: '/chat/completions',
+      embeddingsPath: '/embeddings',
+      chatModel: process.env.GEMINI_CHAT_MODEL ?? 'gemini-2.0-flash',
+      embeddingModel: process.env.GEMINI_EMBEDDING_MODEL ?? 'gemini-embedding-001',
+      stopWords: [],
+      apiKey: process.env.GEMINI_API_KEY,
     };
   }
   if (process.env.LLM_API_URL) {
@@ -82,6 +119,8 @@ export function getLLMConfig(): LLMConfig {
     return {
       provider: 'custom',
       url,
+      chatPath: '/v1/chat/completions',
+      embeddingsPath: '/v1/embeddings',
       chatModel,
       embeddingModel,
       stopWords: [],
@@ -102,6 +141,8 @@ export function getLLMConfig(): LLMConfig {
   return {
     provider: 'ollama',
     url: process.env.OLLAMA_HOST ?? 'http://127.0.0.1:11434',
+    chatPath: '/v1/chat/completions',
+    embeddingsPath: '/v1/embeddings',
     chatModel: process.env.OLLAMA_MODEL ?? 'llama3',
     embeddingModel: process.env.OLLAMA_EMBEDDING_MODEL ?? 'mxbai-embed-large',
     stopWords: ['<|eot_id|>'],
@@ -147,7 +188,7 @@ export async function chatCompletion(
     retries,
     ms,
   } = await retryWithBackoff(async () => {
-    const result = await fetch(config.url + '/v1/chat/completions', {
+    const result = await fetch(config.url + config.chatPath, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -217,7 +258,7 @@ export async function fetchEmbeddingBatch(texts: string[]) {
     retries,
     ms,
   } = await retryWithBackoff(async () => {
-    const result = await fetch(config.url + '/v1/embeddings', {
+    const result = await fetch(config.url + config.embeddingsPath, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -399,11 +440,6 @@ export interface CreateChatCompletionRequest {
    * @memberof CreateChatCompletionRequest
    */
   model: string;
-  // | 'gpt-4'
-  // | 'gpt-4-0613'
-  // | 'gpt-4-32k'
-  // | 'gpt-4-32k-0613'
-  // | 'gpt-3.5-turbo'; // <- our default
   /**
    * The messages to generate chat completions for, in the chat format:
    * https://platform.openai.com/docs/guides/chat/introduction
@@ -489,98 +525,20 @@ export interface CreateChatCompletionRequest {
    */
   user?: string;
   tools?: {
-    // The type of the tool. Currently, only function is supported.
     type: 'function';
     function: {
-      /**
-       * The name of the function to be called. Must be a-z, A-Z, 0-9, or
-       * contain underscores and dashes, with a maximum length of 64.
-       */
       name: string;
-      /**
-       * A description of what the function does, used by the model to choose
-       * when and how to call the function.
-       */
       description?: string;
-      /**
-       * The parameters the functions accepts, described as a JSON Schema
-       * object. See the guide[1] for examples, and the JSON Schema reference[2]
-       * for documentation about the format.
-       * [1]: https://platform.openai.com/docs/guides/gpt/function-calling
-       * [2]: https://json-schema.org/understanding-json-schema/
-       * To describe a function that accepts no parameters, provide the value
-       * {"type": "object", "properties": {}}.
-       */
       parameters: object;
     };
   }[];
-  /**
-   * Controls which (if any) function is called by the model. `none` means the
-   * model will not call a function and instead generates a message.
-   * `auto` means the model can pick between generating a message or calling a
-   * function. Specifying a particular function via
-   * {"type: "function", "function": {"name": "my_function"}} forces the model
-   * to call that function.
-   *
-   * `none` is the default when no functions are present.
-   * `auto` is the default if functions are present.
-   */
   tool_choice?:
-    | 'none' // none means the model will not call a function and instead generates a message.
-    | 'auto' // auto means the model can pick between generating a message or calling a function.
-    // Specifies a tool the model should use. Use to force the model to call
-    // a specific function.
+    | 'none'
+    | 'auto'
     | {
-        // The type of the tool. Currently, only function is supported.
         type: 'function';
         function: { name: string };
       };
-  // Replaced by "tools"
-  // functions?: {
-  //   /**
-  //    * The name of the function to be called. Must be a-z, A-Z, 0-9, or
-  //    * contain underscores and dashes, with a maximum length of 64.
-  //    */
-  //   name: string;
-  //   /**
-  //    * A description of what the function does, used by the model to choose
-  //    * when and how to call the function.
-  //    */
-  //   description?: string;
-  //   /**
-  //    * The parameters the functions accepts, described as a JSON Schema
-  //    * object. See the guide[1] for examples, and the JSON Schema reference[2]
-  //    * for documentation about the format.
-  //    * [1]: https://platform.openai.com/docs/guides/gpt/function-calling
-  //    * [2]: https://json-schema.org/understanding-json-schema/
-  //    * To describe a function that accepts no parameters, provide the value
-  //    * {"type": "object", "properties": {}}.
-  //    */
-  //   parameters: object;
-  // }[];
-  // /**
-  //  * Controls how the model responds to function calls. "none" means the model
-  //  * does not call a function, and responds to the end-user. "auto" means the
-  //  * model can pick between an end-user or calling a function. Specifying a
-  //  * particular function via {"name":\ "my_function"} forces the model to call
-  //  *  that function.
-  //  * - "none" is the default when no functions are present.
-  //  * - "auto" is the default if functions are present.
-  //  */
-  // function_call?: 'none' | 'auto' | { name: string };
-  /**
-   * An object specifying the format that the model must output.
-   *
-   * Setting to { "type": "json_object" } enables JSON mode, which guarantees
-   * the message the model generates is valid JSON.
-   * *Important*: when using JSON mode, you must also instruct the model to
-   * produce JSON yourself via a system or user message. Without this, the model
-   * may generate an unending stream of whitespace until the generation reaches
-   * the token limit, resulting in a long-running and seemingly "stuck" request.
-   * Also note that the message content may be partially cut off if
-   * finish_reason="length", which indicates the generation exceeded max_tokens
-   * or the conversation exceeded the max context length.
-   */
   response_format?: { type: 'text' | 'json_object' };
 }
 
@@ -661,46 +619,4 @@ export class ChatCompletionContent {
     let lastFragment = '';
     try {
       while (true) {
-        const { value, done } = await reader.read();
-        if (done) {
-          // Flush the last fragment now that we're done
-          if (lastFragment !== '') {
-            yield lastFragment;
-          }
-          break;
-        }
-        const data = new TextDecoder().decode(value);
-        lastFragment += data;
-        const parts = lastFragment.split('\n\n');
-        // Yield all except for the last part
-        for (let i = 0; i < parts.length - 1; i += 1) {
-          yield parts[i];
-        }
-        // Save the last part as the new last fragment
-        lastFragment = parts[parts.length - 1];
-      }
-    } finally {
-      reader.releaseLock();
-    }
-  }
-}
-
-export async function ollamaFetchEmbedding(text: string) {
-  const config = getLLMConfig();
-  const { result } = await retryWithBackoff(async () => {
-    const resp = await fetch(config.url + '/api/embeddings', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ model: config.embeddingModel, prompt: text }),
-    });
-    if (resp.status === 404) {
-      const error = await resp.text();
-      await tryPullOllama(config.embeddingModel, error);
-      throw new Error(`Failed to fetch embeddings: ${resp.status}`);
-    }
-    return (await resp.json()).embedding as number[];
-  });
-  return { embedding: result };
-}
+        const { value, done } = await reader.
