@@ -1,4 +1,4 @@
-// That's right! No imports and no dependencies 🤯
+//  That's right! No imports and no dependencies 🤯
 
 const OPENAI_EMBEDDING_DIMENSION = 1536;
 const TOGETHER_EMBEDDING_DIMENSION = 768;
